@@ -14,6 +14,13 @@
     >
       {{ paymentMessages[paymentResult].text }}
     </div>
+    <!-- Confirm Payment Notice (when returning from ECPay) -->
+    <div
+      v-if="paymentResult === 'return' && order.status === 'pending'"
+      class="rounded-xl p-4 mb-6 text-sm bg-blue-50 text-blue-700 border border-blue-100"
+    >
+      已從綠界付款頁返回。若已完成付款，請點擊「確認付款結果」更新訂單狀態。
+    </div>
 
     <!-- Order Info -->
     <div class="bg-white rounded-2xl shadow-sm p-6 mb-6">
@@ -71,20 +78,20 @@
     </div>
 
     <!-- Payment Buttons -->
-    <div v-if="order.status === 'pending'" class="flex gap-4">
+    <div v-if="order.status === 'pending'" class="flex flex-wrap gap-4">
+      <a
+        :href="ecpayCheckoutUrl"
+        class="inline-block bg-rose-primary text-white px-8 py-3 rounded-full text-sm font-medium hover:bg-rose-primary/90 transition-colors text-center"
+      >
+        前往綠界付款
+      </a>
       <button
-        @click="handlePaySuccess"
-        :disabled="paying"
+        v-if="paymentResult === 'return'"
+        @click="confirmPayment"
+        :disabled="confirming"
         class="bg-sage text-white px-8 py-3 rounded-full text-sm font-medium hover:bg-sage/90 transition-colors disabled:opacity-50"
       >
-        {{ paying ? '處理中...' : '付款成功' }}
-      </button>
-      <button
-        @click="handlePayFail"
-        :disabled="paying"
-        class="bg-red-500 text-white px-8 py-3 rounded-full text-sm font-medium hover:bg-red-600 transition-colors disabled:opacity-50"
-      >
-        {{ paying ? '處理中...' : '付款失敗' }}
+        {{ confirming ? '查詢中...' : '確認付款結果' }}
       </button>
     </div>
   </template>

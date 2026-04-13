@@ -2,6 +2,7 @@ const express = require('express');
 const { v4: uuidv4 } = require('uuid');
 const db = require('../database');
 const authMiddleware = require('../middleware/authMiddleware');
+const { queryTradeInfo } = require('../utils/ecpay');
 
 const router = express.Router();
 
@@ -413,6 +414,63 @@ router.patch('/:id/pay', (req, res) => {
     error: null,
     message: action === 'success' ? '付款成功' : '付款失敗'
   });
+});
+
+/**
+ * POST /api/orders/:id/ecpay-query
+ * 主動向綠界查詢交易狀態，更新訂單（本機無法收 ReturnURL 時使用）
+ */
+router.post('/:id/ecpay-query', async (req, res) => {
+  const userId = req.user.userId;
+
+  const order = db.prepare('SELECT * FROM orders WHERE id = ? AND user_id = ?').get(req.params.id, userId);
+  if (!order) {
+    return res.status(404).json({ data: null, error: 'NOT_FOUND', message: '訂單不存在' });
+  }
+
+  if (order.status !== 'pending') {
+    return res.status(400).json({
+      data: null,
+      error: 'INVALID_STATUS',
+      message: '訂單已非待付款狀態'
+    });
+  }
+
+  if (!order.ecpay_trade_no) {
+    return res.status(400).json({
+      data: null,
+      error: 'NOT_INITIATED',
+      message: '此訂單尚未發起綠界付款，請先點擊「前往綠界付款」'
+    });
+  }
+
+  try {
+    const result = await queryTradeInfo(order.ecpay_trade_no);
+
+    if (result.TradeStatus === '1') {
+      db.prepare('UPDATE orders SET status = ? WHERE id = ?').run('paid', order.id);
+      return res.json({
+        data: { status: 'paid' },
+        error: null,
+        message: '付款已確認，感謝您的購買！'
+      });
+    }
+
+    return res.json({
+      data: { status: 'pending' },
+      error: null,
+      message: result.TradeStatus === '0'
+        ? '付款尚未完成，請完成付款後再確認'
+        : '交易狀態異常，請聯繫客服'
+    });
+  } catch (e) {
+    console.error('[ecpay-query] 查詢失敗:', e.message);
+    return res.status(502).json({
+      data: null,
+      error: 'ECPAY_ERROR',
+      message: '向綠界查詢失敗，請稍後再試'
+    });
+  }
 });
 
 module.exports = router;
