@@ -4,6 +4,23 @@
 
 ---
 
+## [1.1.0] — 2026-04-13
+
+### 新增
+
+**ECPay 綠界金流整合**
+- `GET /ecpay/checkout/:orderId` — 產生綠界 AIO 付款表單並自動跳轉；JWT 從 query string `?token=` 取得（因瀏覽器直接導向無法帶 header）
+- `POST /ecpay/return` — 綠界 ReturnURL 回呼 handler；驗證 CheckMacValue（timing-safe）後更新訂單狀態；即使驗證失敗仍回應 `1|OK` 防止綠界重試
+- `POST /api/orders/:id/ecpay-query` — 前端觸發、後端主動向綠界 QueryTradeInfo/V5 查詢交易狀態，確認成功後將訂單 status 更新為 `paid`
+- `src/utils/ecpay.js` — ECPay 工具模組：ECPay 專用 URL encode、CheckMacValue 計算/驗證、AIO Form HTML 產生、QueryTradeInfo 查詢
+- `orders` 表新增 `ecpay_trade_no TEXT` 欄位（後置 migration，idempotent）
+
+**前端調整**
+- `views/pages/order-detail.ejs` — pending 訂單改顯示「前往綠界付款」按鈕（`<a>` 連結）與「確認付款結果」按鈕
+- `public/js/pages/order-detail.js` — 移除模擬付款邏輯（`simulatePay`、`handlePaySuccess`、`handlePayFail`），新增 `confirmPayment()` 呼叫 `/api/orders/:id/ecpay-query` 並即時更新畫面
+
+---
+
 ## [1.0.0] — 2026-04-13
 
 ### 新增

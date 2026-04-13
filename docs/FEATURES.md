@@ -12,7 +12,7 @@
 | 後台商品管理 | ✅ 完成 | 新增/編輯/刪除，有 pending 訂單不可刪除 |
 | 後台訂單查看 | ✅ 完成 | 全訂單列表，可依狀態篩選 |
 | OpenAPI 文件 | ✅ 完成 | 從 JSDoc 產生 openapi.json |
-| ECPay 真實金流整合 | ❌ 未實作 | 環境變數已預留，尚未整合 |
+| ECPay 真實金流整合 | ✅ 完成 | AIO 付款表單跳轉 + QueryTradeInfo 主動查詢 |
 | Email 發送（通知信） | ❌ 未實作 | 無任何 Email 發送機制 |
 | 用戶 Email 驗證 | ❌ 未實作 | 可使用任意 Email 註冊 |
 | 購物車合併（遊客→登入） | ❌ 未實作 | 登入後遊客購物車不會合併 |
@@ -725,3 +725,111 @@ if (res.status === 401) {
 ```
 
 這意味著所有頁面的 API 呼叫都有統一的登入過期處理，無需在每個頁面 JS 中個別處理 401。
+
+---
+
+### 9. ECPay 綠界金流整合
+
+#### 背景說明
+
+本功能整合綠界科技 AIO（All-In-One）付款服務，取代原有的模擬付款機制。由於本機開發環境無法接收綠界的 Server-to-Server 回呼（ReturnURL 為本機 URL，綠界無法連入），付款確認改由**使用者主動觸發**，後端呼叫綠界 `QueryTradeInfo` API 主動查詢交易狀態。
+
+#### 付款流程
+
+```
+使用者                     我方後端                     綠界
+  │                           │                           │
+  ├─ GET /ecpay/checkout/:id ─→│                           │
+  │                           ├─ 取得或產生 ecpay_trade_no │
+  │                           ├─ 儲存至 orders 表          │
+  │                           └─ 產生含 CheckMacValue 的   │
+  │ ←─ HTML 自動跳轉 ───────────│   AIO Form HTML ──────────→│ POST AioCheckOut/V5
+  │                           │                           │
+  ├─ 在綠界完成付款 ────────────────────────────────────────→│
+  │ ←─ ClientBackURL 導回 ─────────────────────────────────│
+  │   /orders/:id?payment=return                          │
+  │                           │                           │
+  ├─ 點「確認付款結果」──────────→│                           │
+  │                           ├─ POST QueryTradeInfo/V5 ──→│
+  │                           │←─ URL-encoded 回應 ─────────│
+  │                           ├─ 驗證 CheckMacValue        │
+  │ ←─ 訂單狀態更新（paid）────│   TradeStatus='1' → paid  │
+```
+
+#### API 端點
+
+**GET /ecpay/checkout/:orderId**
+
+- **認證方式**：因瀏覽器直接導向（`<a>` 連結）無法帶 Authorization header，改從 **query string `?token=...`** 取得 JWT
+- **行為**：
+  1. 驗證 JWT，讀取訂單（確認屬於當前使用者且 `status === 'pending'`）
+  2. 若 `ecpay_trade_no` 為 null → 產生新的 20 字元純英數字交易編號，UPDATE 至 DB
+  3. 若已有 `ecpay_trade_no` → 沿用（允許重新發起付款）
+  4. 組建 AIO 付款參數，計算 CheckMacValue，回傳含自動 submit form 的 HTML
+  5. 瀏覽器自動跳轉至綠界付款頁
+- **若訂單非 pending 狀態**：直接 302 重新導向至 `/orders/:id`
+- **回應**：HTML（非 JSON）
+
+**POST /ecpay/return**
+
+- **用途**：綠界 ReturnURL 回呼（本機通常收不到，保留正確實作供 ngrok 測試）
+- **行為**：
+  1. 驗證 CheckMacValue（timing-safe 比對，防止偽造通知）
+  2. 驗證失敗時仍回應 `1|OK` + HTTP 200（避免綠界重試最多 4 次）
+  3. `RtnCode === '1'` → 由 `MerchantTradeNo` 查找訂單，更新 `status` 為 `paid`
+- **回應格式**：純文字 `1|OK`，HTTP 200（綠界要求）
+
+**POST /api/orders/:id/ecpay-query**（需 JWT）
+
+- **用途**：前端付款完成後主動呼叫，觸發後端向綠界確認交易狀態
+- **前置檢查**：
+  - 訂單不存在或不屬於當前使用者 → 404 `NOT_FOUND`
+  - 訂單 `status !== 'pending'` → 400 `INVALID_STATUS`
+  - 訂單 `ecpay_trade_no` 為 null → 400 `NOT_INITIATED`
+- **成功回應（TradeStatus = '1'）**：
+  ```json
+  { "data": { "status": "paid" }, "error": null, "message": "付款已確認，感謝您的購買！" }
+  ```
+- **待付款（TradeStatus = '0'）**：
+  ```json
+  { "data": { "status": "pending" }, "error": null, "message": "付款尚未完成，請完成付款後再確認" }
+  ```
+- **查詢失敗**（綠界呼叫異常）：502 `ECPAY_ERROR`
+
+#### AIO 付款參數
+
+| 參數 | 值 |
+|------|-----|
+| `MerchantID` | `process.env.ECPAY_MERCHANT_ID` |
+| `MerchantTradeNo` | `orders.ecpay_trade_no`（最長 20 字元純英數） |
+| `MerchantTradeDate` | UTC+8 格式 `yyyy/MM/dd HH:mm:ss` |
+| `PaymentType` | `aio` |
+| `TotalAmount` | `orders.total_amount`（商品總額，整數） |
+| `TradeDesc` | `花卉訂單` |
+| `ItemName` | 商品名稱以 `#` 分隔，截斷至 200 字元 |
+| `ReturnURL` | `${BASE_URL}/ecpay/return` |
+| `ClientBackURL` | `${BASE_URL}/orders/${orderId}?payment=return` |
+| `ChoosePayment` | `ALL`（讓消費者在綠界頁面自選付款方式） |
+| `EncryptType` | `1`（SHA256） |
+| `CheckMacValue` | SHA256 計算（ECPay 專用 URL encode） |
+
+#### 環境變數
+
+| 變數名稱 | 說明 |
+|---------|------|
+| `ECPAY_MERCHANT_ID` | 綠界特店編號 |
+| `ECPAY_HASH_KEY` | CheckMacValue 用 HashKey |
+| `ECPAY_HASH_IV` | CheckMacValue 用 HashIV |
+| `ECPAY_ENV` | `production` 為正式環境；其他值（含未設定）使用測試環境 |
+| `BASE_URL` | 本機完整網址（如 `http://localhost:3001`），用於組建 ReturnURL / ClientBackURL |
+
+#### CheckMacValue 計算規則
+
+依綠界規範（SHA256）：
+1. 過濾掉 `CheckMacValue` 欄位
+2. 依參數名稱大小寫不敏感排序
+3. 組成 `HashKey=...&param1=val1&...&HashIV=...` 字串
+4. 執行 ECPay 專用 URL encode（`encodeURIComponent` → `%20`→`+` → `~`→`%7e` → `'`→`%27` → 全小寫 → .NET 字元替換）
+5. SHA256 hash → 轉大寫 hex
+
+驗證時使用 `crypto.timingSafeEqual()` 進行 timing-safe 比對，防止 timing attack 偽造通知。

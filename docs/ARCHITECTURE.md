@@ -46,14 +46,17 @@
 │   │   ├── adminMiddleware.js # 管理員權限：檢查 req.user.role === 'admin'，須在 authMiddleware 之後
 │   │   ├── errorHandler.js    # 全域錯誤處理（4 參數格式），隱藏 500 細節，統一 JSON 格式
 │   │   └── sessionMiddleware.js # 遊客 Session：從 X-Session-Id header 提取並設置 req.sessionId
-│   └── routes/
-│       ├── authRoutes.js      # /api/auth：register、login、profile
-│       ├── productRoutes.js   # /api/products：商品列表（分頁）、商品詳情（公開，無需認證）
-│       ├── cartRoutes.js      # /api/cart：購物車 CRUD（Dual-Auth：JWT 或 Session ID 均可）
-│       ├── orderRoutes.js     # /api/orders：建立訂單、訂單列表、訂單詳情、模擬付款（需 JWT）
-│       ├── adminProductRoutes.js # /api/admin/products：後台商品管理（需 JWT + admin role）
-│       ├── adminOrderRoutes.js   # /api/admin/orders：後台訂單查看（需 JWT + admin role）
-│       └── pageRoutes.js      # 頁面路由：所有 EJS 頁面的渲染（/ 、/cart、/admin/… 等）
+│   ├── routes/
+│   │   ├── authRoutes.js      # /api/auth：register、login、profile
+│   │   ├── productRoutes.js   # /api/products：商品列表（分頁）、商品詳情（公開，無需認證）
+│   │   ├── cartRoutes.js      # /api/cart：購物車 CRUD（Dual-Auth：JWT 或 Session ID 均可）
+│   │   ├── orderRoutes.js     # /api/orders：建立訂單、訂單列表、訂單詳情、ECPay 查詢（需 JWT）
+│   │   ├── ecpayRoutes.js     # /ecpay：AIO 付款表單產生、ReturnURL 回呼處理
+│   │   ├── adminProductRoutes.js # /api/admin/products：後台商品管理（需 JWT + admin role）
+│   │   ├── adminOrderRoutes.js   # /api/admin/orders：後台訂單查看（需 JWT + admin role）
+│   │   └── pageRoutes.js      # 頁面路由：所有 EJS 頁面的渲染（/ 、/cart、/admin/… 等）
+│   └── utils/
+│       └── ecpay.js           # ECPay 工具：CheckMacValue 計算/驗證、AIO Form 產生、QueryTradeInfo 查詢
 │
 ├── public/                    # 靜態資源（由 express.static 直接提供）
 │   ├── css/
@@ -236,6 +239,14 @@ npm start / node server.js
 | GET | `/api/orders` | JWT | 取得當前用戶訂單列表 |
 | GET | `/api/orders/:id` | JWT | 取得單一訂單詳情（僅限本人） |
 | PATCH | `/api/orders/:id/pay` | JWT | 模擬付款（success/fail） |
+| POST | `/api/orders/:id/ecpay-query` | JWT | 主動向綠界查詢交易狀態，更新訂單 |
+
+### ECPay 金流 API
+
+| Method | 路徑 | 認證 | 說明 |
+|--------|------|------|------|
+| GET | `/ecpay/checkout/:orderId` | JWT（query string `?token=`） | 產生 AIO 付款表單並自動跳轉至綠界 |
+| POST | `/ecpay/return` | 無（CheckMacValue 驗證） | 綠界 ReturnURL 回呼，驗證並更新訂單狀態 |
 
 ### 後台商品 API
 
@@ -452,10 +463,13 @@ CREATE TABLE IF NOT EXISTS orders (
   total_amount      INTEGER NOT NULL,                       -- 訂單總金額（計算自 order_items）
   status            TEXT NOT NULL DEFAULT 'pending'
                     CHECK(status IN ('pending', 'paid', 'failed')), -- 訂單狀態
+  ecpay_trade_no    TEXT,                                   -- 綠界交易編號（20 字元英數，首次發起付款時產生）
   created_at        TEXT NOT NULL DEFAULT (datetime('now')),
   FOREIGN KEY (user_id) REFERENCES users(id)
 );
 ```
+
+> `ecpay_trade_no` 為後置 migration（`ALTER TABLE ADD COLUMN`，idempotent），初始為 null。首次點擊「前往綠界付款」時產生並寫入；若重新付款則沿用同一編號。
 
 ### order_items 表
 
@@ -501,9 +515,17 @@ CREATE TABLE IF NOT EXISTS order_items (
        └─ DELETE cart_items
      │
      ↓
-[模擬付款] PATCH /api/orders/:id/pay
-  ├─ action: "success" → status: 'paid'
-  └─ action: "fail" → status: 'failed'
+[發起綠界付款] GET /ecpay/checkout/:id?token=...
+  ├─ 驗證 JWT（query string）
+  ├─ 取得或產生 ecpay_trade_no，寫入 orders 表
+  └─ 回傳 AIO HTML Form → 瀏覽器自動跳轉至綠界
+     │
+     ↓ （使用者在綠界完成付款，瀏覽器導回 ClientBackURL）
+     │
+[確認付款結果] POST /api/orders/:id/ecpay-query
+  ├─ 呼叫綠界 QueryTradeInfo API
+  ├─ TradeStatus='1' → UPDATE orders SET status='paid'
+  └─ TradeStatus='0' → 不更新，回傳待付款訊息
 ```
 
 ### 認證流程
